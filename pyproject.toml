@@ -1,0 +1,32 @@
+[project]
+name = "hey-louie-agent"
+version = "0.1.0"
+description = "Server-side agent for the Hey Louie feature"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.135.2",
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "modal>=0.64.0",
+    "sentry-sdk[fastapi]>=2.18.0",
+    "python-dotenv>=1.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/evals", "backend/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

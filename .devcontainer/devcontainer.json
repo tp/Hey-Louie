@@ -1,0 +1,27 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "Python 3",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/python:3-3.14-trixie",
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {
+		"ghcr.io/devcontainer-community/devcontainer-features/astral.sh-uv:1": {
+			"version": "0.11.15"
+		},
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"charliermarsh.ruff",
+				"astral-sh.ty",
+				"Anthropic.claude-code",
+				"openai.chatgpt",
+				"esbenp.prettier-vscode"
+			]
+		}
+	},
+	"remoteEnv": {
+		"UV_CACHE_DIR": "${containerWorkspaceFolder}/.cache/uv",
+	}
+}
