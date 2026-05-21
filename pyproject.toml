@@ -23,6 +23,7 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["backend/evals", "backend/tests"]
+python_files = ["test_*.py", "runner.py"]
 
 [tool.ruff]
 line-length = 100

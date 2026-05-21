@@ -62,9 +62,7 @@ def _normalize(s: str) -> str:
 
 @app.get("/llm-smoke")
 async def llm_smoke() -> dict[str, object]:
-    results = await asyncio.gather(
-        _ask_anthropic(), _ask_openai(), return_exceptions=True
-    )
+    results = await asyncio.gather(_ask_anthropic(), _ask_openai(), return_exceptions=True)
     anthropic_ans = results[0] if isinstance(results[0], str) else f"error: {results[0]!r}"
     openai_ans = results[1] if isinstance(results[1], str) else f"error: {results[1]!r}"
     agree = (
