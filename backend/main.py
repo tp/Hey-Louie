@@ -16,11 +16,13 @@ from fastapi import FastAPI
 from openai import AsyncOpenAI
 
 from backend.instrumentation import init_sentry
+from backend.transport.ws import router as ws_router
 
 load_dotenv()
 init_sentry()
 
 app = FastAPI(title="Hey Louie agent")
+app.include_router(ws_router)
 
 
 @app.get("/health")

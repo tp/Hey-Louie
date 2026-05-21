@@ -16,6 +16,30 @@ Split music into search_music + play_music. Reason: returning a query string fro
 
 Claude originally assumed `search_music` would stay server-local because a real backend "would call a catalog API." That's wrong for this project: the music library only exists on the iPad (no server-side catalog API is in scope), so on Day 2 `search_music` flips to `local=False` alongside the four house tools. Every tool round-trips. This is actually a useful constraint to write about — it mirrors how Claude Code and similar coding agents work: the model runs on a server but every interesting tool (read file, run command, inspect state) executes on a physically-local machine that holds the real data. The agent harness pays a latency cost for that round-trip and earns the right to never see the data directly. Worth a paragraph in the blog post.
 
+## Session is the agent ↔ tool-executor seam
+
+The agent layer (`agent/loop.py`, `agent/session.py`) knows nothing about iPads, WebSockets, in-memory state, or catalogs. It interacts with one thing: a `Session` Protocol with `schemas()` and `dispatch_tool()`. Two implementations exist — `FakeLouie` (in `evals/fake_louie.py`, the in-memory reference impl used for evals) and `WebSocketSession` (in `transport/ws.py`, the production wire). Both inherit from `Session` explicitly with `@override` decorators so signature drift is a type error at definition time.
+
+This was a real shift from the Day-1 design, which had a `ToolRegistry` with dual-mode `call()` branching on `if session is not None and not tool.local`. That mixed two concerns into one object and made the test-only catalog leak into production imports. The split: schemas + handlers + catalog all belong to "the executor" (whoever implements `Session`), not to the agent layer. The agent layer just routes calls.
+
+Why this matters for the iPad seam: it lets tool discovery be client-driven. `WebSocketSession.schemas()` returns whatever the client sent in `hello.tools` — the backend has no static knowledge of the iPad's tool list. Adding a tool to the iPad is a client-only change. `FakeLouie` happens to hardcode its own copy (it IS a fake iPad), and the CONTRACT block in its docstring spells out that the iPad's `HeyLouieSchemas.swift` and `HeyLouieToolDispatcher.swift` must match.
+
+## Server-side tools: deferred to a future sprint
+
+The current loop only knows about client-mediated tools (those `session.dispatch_tool` routes to the iPad). Server-side tools — things the backend would execute itself, e.g. a code-exec sandbox, web fetch, or file ops — are out of scope for this sprint. There's a placeholder slot: `run_turn(..., extra_tools=())` joins server-side schemas into the model's tool list. When the first server-side tool lands, `run_turn` grows a `server_dispatch: Callable[[name, args, id], Awaitable[ToolResultBlock]]` parameter and the `gather()` over tool_uses tries it for any name in `extra_tools` before falling back to `session.dispatch_tool`. This is intentionally vapor for Day 2.
+
+Worth flagging: `ask_user` is **not** a server-side tool — that was a mistake in early notes. It lives in the iPad's tool catalog and reaches the loop through `session.schemas()` like any other iPad tool. Its shape is `{question, choices: [{id, label}, ...]}` — the iPad displays a tap popover (not a re-record), the user picks one, the picked choice id comes back as `tool_result`. So disambiguation is "tap to clarify", not "re-record to clarify"; that's a meaningful UX choice worth mentioning in the blog post. The blog post should also not lump `ask_user` in with future server-side tools (sandbox/code-exec/web-fetch).
+
+## WebSocket protocol: per-turn, message-typed, futures-by-tool-use-id
+
+The iPad opens a fresh WebSocket per push-to-talk → response cycle (not held open across turns). On connect the client sends `hello` with its full `tools` schema list, then `utterance`. The backend kicks off `run_turn`, and every tool call goes out as a `tool_call` message; the iPad answers with `tool_result` (matched by `tool_use_id`); the loop terminates with `final_text`, after which the server closes. `cancel` from either side aborts the in-flight turn.
+
+Per-turn rather than per-session because (a) Modal autoscales per second — a persistent socket pins one container per user — and (b) bidirectional traffic only matters _during_ a turn; between turns there's nothing to push. The trade-off is cold-start latency on follow-ups ("turn it up" 3s after "play Coldplay"); the answer is session-scoped server state (Modal Dict or similar) keyed by session id, hydrated on each new WS — parked in [[followups]] for week two.
+
+Tool calls fan out in parallel via `asyncio.gather`, so the WebSocket can have multiple concurrent sends. A per-session `asyncio.Lock` around the send call serializes them; `tool_use_id` lets the iPad and backend correlate without ordering guarantees. Pending tool dispatches live in `Session.pending: dict[str, asyncio.Future[ToolResultBlock]]`.
+
+Message types — client → server: `hello`, `utterance`, `tool_result`, `cancel`. Server → client: `tool_call`, `final_text`, `error`. Everything is JSON text frames. The shape is locked here so the iPad agent and backend agent don't drift.
+
 ## `play_music` looks up the title in the catalog, not a session registry
 
 The ID returned by `search_music` is shaped `$id:<type>:<slug>` (e.g. `$id:genre:jazz`). `play_music` validates the id against the catalog and uses the canonical title stored there — it does NOT carry a session-scoped registry of prior `search_music` results, and it does NOT parse the slug to reconstruct the title (an earlier attempt that gave approximate results like `bohemian-rhapsody` → `Bohemian Rhapsody`). Reason: matches how the real iPad will behave — the device holds the library and can resolve any valid id to its display title regardless of which queries preceded it, so the backend's mock should behave the same. `FakeLouie.music` stores both `now_playing_id` (stable, asserted in evals) and `now_playing_title` (human-facing, read back by `query_state`). The pair is always set together.

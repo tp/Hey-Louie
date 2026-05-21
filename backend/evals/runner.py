@@ -4,6 +4,10 @@ Parametrized over (adapter_factory, eval_case). Day 1 registers only the
 Anthropic adapter; Day 3 adds OpenAI and emits a CSV with cross-provider
 latency / token / cost columns. For now we just assert pass/fail.
 
+Each test constructs a fresh `FakeLouie` — which is both the in-memory state
+and the `Session` the loop executes tools against — runs an optional `setup`,
+drives `run_turn`, and asserts on tool names + the per-case `check`.
+
 Run: `pytest backend/evals/` (asyncio_mode=auto is set in pyproject.toml).
 """
 
@@ -17,9 +21,8 @@ import pytest
 from backend.adapters.anthropic import AnthropicAdapter
 from backend.adapters.base import LLMAdapter
 from backend.agent.loop import run_turn
-from backend.agent.tools import default_registry
 from backend.evals.cases import CASES, EvalCase
-from backend.evals.fake_louie import default_state
+from backend.evals.fake_louie import FakeLouie
 
 # Each entry is (label, factory). Day 3 appends ("openai", lambda: OpenAIAdapter()).
 # A factory (rather than a singleton) means a fresh client per test, which keeps
@@ -50,10 +53,11 @@ async def test_eval_case(
     case: EvalCase,
 ) -> None:
     adapter = adapter_factory()
-    registry = default_registry()
-    state = default_state()
+    fake = FakeLouie()
+    if case.setup is not None:
+        case.setup(fake)
 
-    result = await run_turn(adapter, registry, state, case.utterance)
+    result = await run_turn(adapter, fake, case.utterance)
 
     called = result.tool_names
     assert sorted(called) == sorted(case.expected_tools), (
@@ -69,4 +73,4 @@ async def test_eval_case(
         )
 
     if case.check is not None:
-        case.check(state, result.final_text)
+        case.check(fake, result.final_text)

@@ -13,15 +13,15 @@ DO:
 - Keep tool descriptions excellent. Bad descriptions = wrong tool choice.
   When generating or editing a tool, also review its description.
 - Use the canonical Message/Block types from adapters/base.py everywhere.
-  Never store provider-native message dicts in Session.messages.
+  Never store provider-native message dicts in the conversation history.
 - Use `asyncio.gather` for parallel tool execution. Never sequentialize.
 - Log decisions in DECISIONS.md as you make them. One paragraph each.
-- Run `pytest backend/evals/` after any change to agent/ or adapters/.
+- Run `uv run pytest backend/` after any change to agent/, adapters/, or transport/.
 
 DON'T:
 
-- Add tools beyond the five in agent/tools.py. If you think one is needed,
-  add a line to FOLLOWUPS.md and stop.
+- Add tools beyond the five in evals/fake_louie.py (LOUIE_TOOL_SCHEMAS).
+  If you think one is needed, add a line to FOLLOWUPS.md and stop.
 - Add features to the Louie testbed. The harness is the product.
 - Reach for LangChain, LangGraph, LiteLLM, or Pydantic AI in the main path.
   These are explicitly excluded — the hand-rolled adapter is the point.
@@ -32,7 +32,7 @@ DON'T:
 
 ## Architecture invariants
 
-- Backend agent loop dispatches tools; iPad executes them (except `ask_user`).
+- Backend agent loop dispatches every tool to the iPad via `Session.dispatch_tool`; the iPad executes them (including `ask_user`, which shows a tap popover and returns the picked choice id).
 - WebSocket protocol exactly as documented in PLAN.md "Architecture summary".
 - Sentry instrumentation uses OpenTelemetry `gen_ai.*` semantic conventions.
 

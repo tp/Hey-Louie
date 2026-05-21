@@ -3,6 +3,10 @@
 Eval cases are written before the loop they exercise — they define what
 "working" means. Day 3 expands this file to 25–30 cases with disambiguation,
 parallel tool calls, and cancellation.
+
+The `check` callback receives the FakeLouie (which IS the session — see
+`evals/fake_louie.py`) and the agent's final narration. Assertions go straight
+against in-memory state; no need to use `query_state` for verification.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ from dataclasses import dataclass
 
 from backend.evals.fake_louie import FakeLouie
 
+InitialState = Callable[[FakeLouie], None]
+
 
 @dataclass(frozen=True)
 class EvalCase:
@@ -20,6 +26,8 @@ class EvalCase:
     # Exact set of tool names the agent must call (compared as a set, so
     # order is irrelevant but extras and omissions both fail the case).
     expected_tools: list[str]
+    # Optional state seed run before the turn (e.g. prime now_playing).
+    setup: InitialState | None = None
     # Optional post-turn assertion over (final FakeLouie state, final agent text).
     # Should raise AssertionError on mismatch.
     check: Callable[[FakeLouie, str], None] | None = None
@@ -32,7 +40,6 @@ def _check_jazz_playing(state: FakeLouie, _final_text: str) -> None:
     # Assert the stable catalog id, not a narration title: the search hit for
     # "jazz" is unambiguous, so the agent has no excuse for picking anything
     # else. Day 3 will add a Thriller case where multiple ids are valid.
-    # Bare `==` asserts get pytest's rich both-sides diff on failure.
     assert state.music.is_playing
     assert state.music.now_playing_id == "$id:genre:jazz"
 
@@ -51,10 +58,18 @@ def _check_bedroom_climate(state: FakeLouie, _final_text: str) -> None:
     assert state.climate["bedroom"].target_c == 19.0
 
 
+def _seed_thriller_playing(state: FakeLouie) -> None:
+    """Prime the state so 'what's playing?' has a real answer to narrate."""
+    state.music.now_playing_id = "$id:album:thriller"
+    state.music.now_playing_title = "Thriller"
+    state.music.is_playing = True
+
+
 def _check_query_music(_state: FakeLouie, final_text: str) -> None:
-    # Read-only tool; just assert the agent produced narration after the call.
-    # Day 3 tightens this with substring assertions once we seed initial state.
-    assert final_text.strip()
+    # The seed put Thriller on; the agent must read state and mention it.
+    # Case-insensitive substring is the right granularity — the model may
+    # narrate "You're listening to Thriller right now." or just "Thriller."
+    assert "thriller" in final_text.lower(), f"expected Thriller in narration, got: {final_text!r}"
 
 
 # --- cases ---------------------------------------------------------------
@@ -91,6 +106,7 @@ CASES: list[EvalCase] = [
         name="query_music",
         utterance="What's currently playing?",
         expected_tools=["query_state"],
+        setup=_seed_thriller_playing,
         check=_check_query_music,
     ),
 ]

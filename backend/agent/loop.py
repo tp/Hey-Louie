@@ -2,17 +2,28 @@
 
 `run_turn` drives one user utterance to a final spoken response. Each step
 calls the adapter once; if the model emitted tool_use blocks, every tool in
-that message is dispatched in parallel (`asyncio.gather`), the results are
-appended as a single user message of `ToolResultBlock`s, and we loop. The
-loop terminates on any stop reason other than `tool_use`.
+that message is dispatched in parallel via `session.dispatch_tool`, the
+results are appended as a single user message of `ToolResultBlock`s, and we
+loop. The loop terminates on any stop reason other than `tool_use`.
 
-Day 1 omits: streaming, cancellation, `ask_user`. Cancellation lands Day 2
-once a real Session holds the cancel flag; `ask_user` lands Day 3.
+The agent layer knows nothing about iPads, WebSockets, or in-memory state —
+that all lives behind the `Session` interface. Two Sessions exist today:
+`FakeLouie` (eval suite) and `WebSocketSession` (production wire).
+
+`extra_tools` is the slot for server-side tools — things the backend executes
+directly without round-tripping to the iPad (future: code-exec sandbox, web
+fetch, file ops). Currently empty: no server-side tools exist in this sprint.
+See `DECISIONS.md "Server-side tools: deferred to a future sprint"` for the
+future-routing plan. (Note: `ask_user` is NOT a server-side tool — it lives
+in the iPad's tool catalog and reaches the loop through `session.schemas()`.
+Its shape is question + tap-able choices, the iPad shows a popover, and the
+picked choice id comes back as `tool_result`.)
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,10 +32,10 @@ from backend.adapters.base import (
     Message,
     StopReason,
     TextBlock,
+    ToolSchema,
     ToolUseBlock,
 )
-from backend.agent.tools import ToolRegistry
-from backend.evals.fake_louie import FakeLouie
+from backend.agent.session import Session
 
 # One paragraph. Each clause earns its place; the eval suite is the regression
 # net if a tweak helps one case and breaks another. Day-3 stretch is to A/B
@@ -73,19 +84,26 @@ class AgentLoopError(RuntimeError):
 
 async def run_turn(
     adapter: LLMAdapter,
-    registry: ToolRegistry,
-    state: FakeLouie,
+    session: Session,
     utterance: str,
     *,
     history: list[Message] | None = None,
     system: str = SYSTEM_PROMPT,
     max_steps: int = 8,
+    extra_tools: Sequence[ToolSchema] = (),
 ) -> TurnResult:
     """Drive one user utterance to a final assistant response.
 
     `history` is the prior conversation; pass None for a fresh turn. The full
     updated history (including this turn) comes back on `TurnResult.messages`
     so the caller can feed it back in for multi-turn dialogue.
+
+    `extra_tools` joins server-side tool schemas into the list the model sees.
+    Their dispatch is not yet routed — when the first server-side tool lands,
+    this signature grows a `server_dispatch: Callable[[name, args, id], Awaitable[ToolResultBlock]]`
+    callable, and the gather() below tries it for any name that's in
+    `extra_tools` before falling back to `session.dispatch_tool`. For Day 2
+    `extra_tools` is empty and the routing question hasn't bitten us.
     """
     messages: list[Message] = list(history or [])
     messages.append(Message(role="user", content=[TextBlock(text=utterance)]))
@@ -96,10 +114,10 @@ async def run_turn(
     last_model = adapter.model
     stop_reason: StopReason = "end_turn"
 
-    schemas = registry.schemas()
+    tools: list[ToolSchema] = [*session.schemas(), *extra_tools]
 
     for step in range(1, max_steps + 1):
-        result = await adapter.complete(system=system, messages=messages, tools=schemas)
+        result = await adapter.complete(system=system, messages=messages, tools=tools)
         messages.append(result.message)
         input_tokens += result.usage.input_tokens
         output_tokens += result.usage.output_tokens
@@ -123,7 +141,7 @@ async def run_turn(
         # gather() preserves input order, so results line up with tool_uses by
         # index — needed to pair tool_use_ids back to their results.
         results = await asyncio.gather(
-            *[registry.call(tu.name, tu.input, state, tu.id) for tu in tool_uses]
+            *[session.dispatch_tool(tu.name, tu.input, tu.id) for tu in tool_uses]
         )
         for tu, res in zip(tool_uses, results, strict=True):
             tool_calls.append(ToolCallRecord(name=tu.name, input=tu.input, is_error=res.is_error))
