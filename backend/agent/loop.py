@@ -111,7 +111,11 @@ SYSTEM_PROMPT = (
     "default and say what you did. When a search returns hits where one type/title clearly "
     "matches the user's phrasing, take that hit silently rather than asking. For music, "
     "always call search_music first to get a real id, then play_music with that id — never "
-    "synthesize or pass raw queries to play_music. For state questions ('what's playing?', "
+    "synthesize or pass raw queries to play_music. If search_music returns no hits and the "
+    "request looks like an entity name, retry once with a phonetically similar query before "
+    "giving up. Never offer alternatives in narration — act on your best interpretation, use "
+    "ask_user, or say you couldn't find it. "
+    "For state questions ('what's playing?', "
     "'is the kitchen on?'), call query_state with the narrowest subsystem before answering. "
     "Trust the user's request literally; don't volunteer changes they didn't ask for."
 )

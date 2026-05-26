@@ -53,6 +53,56 @@ Cross-provider observations from the CSV (these are the bits the blog post can c
 
 What this sweep doesn't measure yet (Day 4 territory): whether the parallel cases actually dispatched tools in one assistant message vs serialized into multiple turns. The `tools_called` column is order-preserving but doesn't expose the message boundary. Adding `steps` to the CSV would catch this — parked.
 
+## Sentry PII: prompts + responses captured during the sprint
+
+Both LLM integrations are initialized with `include_prompts=True` and the SDK with `send_default_pii=True` (see `backend/instrumentation.py`). That means every captured event — `gen_ai.chat` spans, `gen_ai.invoke_agent` spans, errors — carries the full system prompt, user utterance, assistant text, and tool inputs/outputs. The manual spans we added in Day 4 also set `gen_ai.prompt` and `gen_ai.response.text` directly.
+
+This is acceptable now because the project is a solo build, the data is the developer's own home commands ("turn on the kitchen lights"), and `traces_sample_rate=1.0` means a small number of events go to a private Sentry project. It is **not** acceptable for any deployment serving other users without first deciding what to do about: (a) household members other than the developer being recorded; (b) accidental capture of sensitive utterances ("set an appointment with Dr. Smith…" if the tool catalog ever grows); (c) cross-organization Sentry views where engineers from unrelated projects can read traces.
+
+The right production answer has three layers, in order of cost:
+- **`before_send` / `before_send_transaction` scrubbing** to redact `gen_ai.prompt` and `gen_ai.response.text` before egress — keep the structural data (tokens, latencies, tool names) without the payloads.
+- **Per-environment gating**: `include_prompts=True` only when `SENTRY_ENVIRONMENT == "development"`.
+- **Sentry's PII data scrubbing rules** applied server-side as a defense in depth.
+
+Parked as a follow-up; the screenshot the Day-4 blog post wants is more valuable with prompts visible, and the production hardening is well-understood enough to write up later without re-discovering it.
+
+## STT mangling: model retry beats tool-side fuzziness
+
+Day 4 added three STT-mangled eval cases (`stt_mangle_queen`, `stt_mangle_thriller_song`, `stt_mangle_miles_davis`) — utterances like "put on some kween" that the catalog's exact-substring search returns `[]` for on first try. The cases ask: does the agent recover?
+
+**Baseline (no prompt change), both models recovered 2/3 — but on different cases.** Sonnet failed on Thriller by *narrating* a confirmation question ("did you mean Thriller by Michael Jackson?") — the model knew the answer but chose to ask via text instead of acting. GPT-5-mini failed on Queen by giving up after one empty search. Both 2/3 but the failure modes are completely different — that's the cross-model story the blog post wants.
+
+Considered three tool-side responses and rejected all of them:
+
+1. **Explicit `alt_tokens` per catalog entry.** Hand-code "thrill her" → Thriller. Doesn't scale: real catalogs are 10M+ entries and STT errors are open-ended.
+2. **Phonetic / Levenshtein matching in the tool.** Adds a dep and introduces false-positive risk on no-match cases like `no_match_lady_gaga`.
+3. **LLM-side correction pre-pass.** A cheap second model rewrites the utterance against the catalog. Powerful, but a separate model call per turn — parked for a future post.
+
+The real layers for a production system are **STT-side biasing** (`SFSpeechRecognitionRequest.contextualStrings` with the user's top-N artists, capped at the OS's ~50K limit) and **model-side world knowledge** (the model already knows "Coldplay" is a band — let it correct).
+
+**What Day 4 shipped is the model-side fix as a system-prompt clause** (`agent/loop.py`):
+
+> If search_music returns no hits and the request looks like an entity name, retry once with a phonetically similar query before giving up. Never offer alternatives in narration — act on your best interpretation, use ask_user, or say you couldn't find it.
+
+This is the third version of the clause. The CSVs in `backend/evals/` (`results_stt_baseline.csv`, `results_stt_with_examples.csv`, `results_stt_minimal.csv`, plus the live `results.csv`) trace the ablation:
+
+1. **First draft (with leaked examples).** Included literal `'kween' for 'Queen', 'thrill her' for 'Thriller'` inside the prompt. 6/6 passed — but the test was circular. The model wasn't generalizing; it was looking up the answer in its own context window. The eval cases used exactly those phrases. Caught by the user, not by the suite.
+2. **Stripped version.** Removed all specific examples, the leading "real artist/song/album" categorization, and the explicit "did you mean X?" prohibition. Just "retry once with a corrected spelling." Still 6/6 passed — examples were decorative for correctness — but **GPT-5-mini's output tokens jumped ~50%** (351-664 vs 211-371) and **latency roughly doubled** (8-17s vs 5-10s). Sonnet was unchanged. The few-shot examples were an inference-time optimization for the smaller model, not a correctness aid. Worth its own paragraph in the blog post: when an ablation looks like "no regression," check the cost columns.
+3. **Final version (current).** Added the failure-mode guidance back, abstracted: "Never offer alternatives in narration — act on your best interpretation, use ask_user, or say you couldn't find it." Three legitimate exits, no fourth. Also reframed "corrected spelling" → "phonetically similar query" — STT errors are phonetic, not orthographic, and the model needs to think about sound, not letters. 6/6 still pass; the test is no longer self-fulfilling.
+
+**Bonus the clause didn't directly ask for.** Sonnet started preemptively searching with the phonetically corrected spelling on the first try, skipping the empty-result round-trip entirely (`search → play`, 2 tools). GPT-5-mini does the literal retry pattern (`search → search → play`, 3 tools) on most cases. The clause taught a broader generalization than its literal text, but only to Sonnet.
+
+**Cost summary across the six cases on the final prompt.** Sonnet: ~$0.023/case, ~135-140 output tokens, mostly 6s with one 12s outlier. GPT-5-mini: ~$0.002/case, 221-555 output tokens, 6-12s. The output-token range on GPT-5-mini is much wider than Sonnet's — reasoning leakage on the cases requiring real correction.
+
+**Risk we did not regression-test:** `no_match_lady_gaga`. Catalog truly has no Lady Gaga; the new clause might tempt the model into a phantom retry instead of graceful narration. Worth a full-suite re-run before publishing the blog post.
+
+**Blog-post angles** from this ablation alone:
+
+- The "tool fix" was prompt engineering, not code. The model already had the knowledge; the prompt just had to give it permission to retry.
+- Few-shot examples in a system prompt are sometimes inference-time optimizations, not correctness aids. Stripping them passed all tests but spiked cost on the smaller model. The CSV table is the artifact: "no regression on green, but the latency column tells the real story."
+- Models have different self-corrective defaults. Sonnet preempts the bad query; GPT-5-mini retries literally. The cost and latency differences are visible in the tool-call patterns, not just the totals.
+- An eval where the prompt names the test inputs is theatre. Worth saying out loud — easy to fall into, easy to miss without a careful reader.
+
 ## `play_music` looks up the title in the catalog, not a session registry
 
 The ID returned by `search_music` is shaped `$id:<type>:<slug>` (e.g. `$id:genre:jazz`). `play_music` validates the id against the catalog and uses the canonical title stored there — it does NOT carry a session-scoped registry of prior `search_music` results, and it does NOT parse the slug to reconstruct the title (an earlier attempt that gave approximate results like `bohemian-rhapsody` → `Bohemian Rhapsody`). Reason: matches how the real iPad will behave — the device holds the library and can resolve any valid id to its display title regardless of which queries preceded it, so the backend's mock should behave the same. `FakeLouie.music` stores both `now_playing_id` (stable, asserted in evals) and `now_playing_title` (human-facing, read back by `query_state`). The pair is always set together.

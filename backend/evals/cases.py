@@ -371,6 +371,42 @@ CASES: list[EvalCase] = [
         setup=_setup_thriller_disambig,
         check=_check_thriller_disambig,
     ),
+    # === STT-mangled utterances (recovery via model world knowledge) ===
+    #
+    # Real `SFSpeechRecognizer` output is phonetically plausible but lexically
+    # wrong. Our catalog token match is exact-substring, so all three queries
+    # below return [] on first search. The recovery path is *the model* —
+    # which already knows 'kween' isn't a band but 'Queen' is — retrying
+    # search_music with a corrected spelling. No alt-tokens or fuzzy match
+    # in the tool itself: extending the catalog can't anticipate every
+    # mishearing in a 100M-track world. See DECISIONS.md "STT mangling".
+    #
+    # set(tools_called) == set(expected_tools) means multiple retries are
+    # allowed silently — the assertion that matters is `_check_now_playing`,
+    # which fails if the model gave up or landed on the wrong id.
+    EvalCase(
+        name="stt_mangle_queen",
+        utterance="Put on some kween.",
+        expected_tools=["search_music", "play_music"],
+        forbidden_tools=NO_ASK,
+        check=_check_now_playing("$id:artist:queen"),
+    ),
+    EvalCase(
+        name="stt_mangle_thriller_song",
+        # "the song" disambiguates after the retry surfaces both hits, so this
+        # case isolates the mangling-recovery axis from the ask_user axis.
+        utterance="Play thrill her, the song.",
+        expected_tools=["search_music", "play_music"],
+        forbidden_tools=NO_ASK,
+        check=_check_now_playing("$id:song:thriller"),
+    ),
+    EvalCase(
+        name="stt_mangle_miles_davis",
+        utterance="Play some myles davis.",
+        expected_tools=["search_music", "play_music"],
+        forbidden_tools=NO_ASK,
+        check=_check_now_playing("$id:artist:miles-davis"),
+    ),
     # === graceful no-match ===
     EvalCase(
         name="no_match_lady_gaga",
