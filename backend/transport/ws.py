@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from backend.adapters.anthropic import AnthropicAdapter
 from backend.adapters.base import LLMAdapter, ToolResultBlock, ToolSchema
+from backend.adapters.openai import OpenAIAdapter
 from backend.agent.loop import AgentLoopError, run_turn
 from backend.agent.session import Session
 
@@ -51,7 +53,8 @@ AdapterFactory = Callable[[], LLMAdapter]
 
 
 def _default_adapter_factory() -> LLMAdapter:
-    return AnthropicAdapter()
+    # Randomize provider per session so both adapters get exercised in normal use.
+    return random.choice([AnthropicAdapter, OpenAIAdapter])()
 
 
 _adapter_factory: AdapterFactory = _default_adapter_factory
@@ -178,8 +181,10 @@ async def agent_ws(ws: WebSocket) -> None:
                     await send({"type": "error", "message": f"bad hello: {exc}"})
                     continue
                 log.info(
-                    "session %s: hello, tools=%s",
+                    "session %s: hello, adapter=%s model=%s tools=%s",
                     session.session_id,
+                    session.adapter.name,
+                    getattr(session.adapter, "model", "?"),
                     [s.name for s in session.schemas()],
                 )
 
