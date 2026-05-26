@@ -44,8 +44,12 @@ SYSTEM_PROMPT = (
     "You are Louie, a voice agent for a home. The user speaks to you via push-to-talk "
     "and your reply is spoken aloud, so keep narration to one short sentence — no lists, "
     "no markdown, no preamble like 'sure, I'll do that'. Prefer confident action with a "
-    "brief confirmation ('Playing jazz.') over asking clarifying questions; only ask when "
-    "a request is genuinely ambiguous and you can't pick a reasonable default. For music, "
+    "brief confirmation ('Playing jazz.') over asking clarifying questions. Use ask_user "
+    "sparingly: only when (a) two or more plausible interpretations exist AND (b) picking "
+    "the wrong default would noticeably annoy the user (e.g. 'play Thriller' → song vs "
+    "album). Never ask about which room, what temperature, or which light — pick a sensible "
+    "default and say what you did. When a search returns hits where one type/title clearly "
+    "matches the user's phrasing, take that hit silently rather than asking. For music, "
     "always call search_music first to get a real id, then play_music with that id — never "
     "synthesize or pass raw queries to play_music. For state questions ('what's playing?', "
     "'is the kitchen on?'), call query_state with the narrowest subsystem before answering. "
@@ -82,6 +86,34 @@ class AgentLoopError(RuntimeError):
     """Raised when the loop can't terminate (e.g. exceeds max_steps)."""
 
 
+class TurnCancelled(RuntimeError):
+    """Raised when `cancel_token` was set mid-turn.
+
+    Carries the partial messages, tool_calls, and per-provider token counts
+    accumulated before the cancel so the WebSocket layer can drain/log them
+    (in production), eval cases can assert that at least one tool dispatched
+    before bail-out, and the CSV row still reflects what was actually spent.
+    """
+
+    def __init__(
+        self,
+        messages: list[Message],
+        tool_calls: list[ToolCallRecord],
+        steps: int,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = "",
+    ) -> None:
+        super().__init__(f"turn cancelled after {steps} step(s), {len(tool_calls)} tool call(s)")
+        self.messages = messages
+        self.tool_calls = tool_calls
+        self.steps = steps
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.model = model
+
+
 async def run_turn(
     adapter: LLMAdapter,
     session: Session,
@@ -91,6 +123,7 @@ async def run_turn(
     system: str = SYSTEM_PROMPT,
     max_steps: int = 8,
     extra_tools: Sequence[ToolSchema] = (),
+    cancel_token: asyncio.Event | None = None,
 ) -> TurnResult:
     """Drive one user utterance to a final assistant response.
 
@@ -117,6 +150,19 @@ async def run_turn(
     tools: list[ToolSchema] = [*session.schemas(), *extra_tools]
 
     for step in range(1, max_steps + 1):
+        # Check before paying for the model call. In production the WebSocket
+        # `cancel` message sets this; in evals the runner wires it to fire
+        # after the first tool result.
+        if cancel_token is not None and cancel_token.is_set():
+            raise TurnCancelled(
+                messages,
+                tool_calls,
+                step - 1,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=last_model,
+            )
+
         result = await adapter.complete(system=system, messages=messages, tools=tools)
         messages.append(result.message)
         input_tokens += result.usage.input_tokens
@@ -147,6 +193,19 @@ async def run_turn(
             tool_calls.append(ToolCallRecord(name=tu.name, input=tu.input, is_error=res.is_error))
 
         messages.append(Message(role="user", content=list(results)))
+
+        # Second check: tool results are in but we haven't started the next
+        # model call yet. Cheapest place to honor a cancel that arrived while
+        # tools were running.
+        if cancel_token is not None and cancel_token.is_set():
+            raise TurnCancelled(
+                messages,
+                tool_calls,
+                step,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=last_model,
+            )
 
     raise AgentLoopError(
         f"agent loop exceeded max_steps={max_steps} (last stop_reason={stop_reason})"

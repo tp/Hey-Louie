@@ -40,6 +40,19 @@ Tool calls fan out in parallel via `asyncio.gather`, so the WebSocket can have m
 
 Message types — client → server: `hello`, `utterance`, `tool_result`, `cancel`. Server → client: `tool_call`, `final_text`, `error`. Everything is JSON text frames. The shape is locked here so the iPad agent and backend agent don't drift.
 
+## Day 3 sweep: Sonnet 4.6 vs GPT-5-mini, 23 cases, all pass
+
+First full cross-provider sweep landed at 46/46 green (Anthropic Sonnet 4.6 + OpenAI GPT-5-mini, see `evals/results.csv`). The all-pass result was suspicious enough to re-verify the assertions — they're load-bearing: forbid `ask_user` on 17 cases, demand it on 1 (`thriller_disambig`), demand the picked id be acted on, demand no `play_music` after an empty search, demand graceful "can't help" narration on `outside_scope_weather`. The system prompt's "use ask_user sparingly + pick a default and narrate" clause is doing real work — earlier prompt variants over-asked on `play_album_thriller_explicit` and `play_artist_queen`. Worth a paragraph in the blog post about how much prompt sensitivity disambiguation cases have.
+
+Cross-provider observations from the CSV (these are the bits the blog post can cite without picking winners):
+
+- **Cost gap is ~10-25×.** Sonnet 4.6 ran ~$0.015-0.033 per case; GPT-5-mini ~$0.001-0.003. Driven by input pricing (Sonnet $3/Mtok vs GPT-5-mini $0.25/Mtok) and the fact that even simple cases burn ~5k input tokens once the tool catalog + system prompt are loaded.
+- **GPT-5-mini emits 2-6× more output tokens on cases with non-obvious reasoning.** The starkest is `climate_fahrenheit` (68°F → 20°C conversion): 547 output tokens vs Sonnet's 89. Looks like chain-of-thought leaking into the response, even though our adapter doesn't enable a `reasoning=` mode. Worth investigating Day 4 whether `reasoning={"effort":"minimal"}` brings it in line; the cost impact today is ~10× the smallest cases.
+- **Empty-search recovery differs.** On `no_match_lady_gaga` (catalog has no Lady Gaga), Sonnet 4.6 called `search_music` twice (likely with a varied query); GPT-5-mini called it once and gave up. Both narrated "couldn't find" correctly, but Sonnet's retry is the kind of behavior worth a real Day-4 STT-mangling case — does the retry surface a fuzzy-corrected query that succeeds?
+- **Latency is roughly comparable** (~3-6s for simple cases, 6-10s for parallel/disambig), with GPT-5-mini occasionally slower on long-output cases. Network noise dominates the variance.
+
+What this sweep doesn't measure yet (Day 4 territory): whether the parallel cases actually dispatched tools in one assistant message vs serialized into multiple turns. The `tools_called` column is order-preserving but doesn't expose the message boundary. Adding `steps` to the CSV would catch this — parked.
+
 ## `play_music` looks up the title in the catalog, not a session registry
 
 The ID returned by `search_music` is shaped `$id:<type>:<slug>` (e.g. `$id:genre:jazz`). `play_music` validates the id against the catalog and uses the canonical title stored there — it does NOT carry a session-scoped registry of prior `search_music` results, and it does NOT parse the slug to reconstruct the title (an earlier attempt that gave approximate results like `bohemian-rhapsody` → `Bohemian Rhapsody`). Reason: matches how the real iPad will behave — the device holds the library and can resolve any valid id to its display title regardless of which queries preceded it, so the backend's mock should behave the same. `FakeLouie.music` stores both `now_playing_id` (stable, asserted in evals) and `now_playing_title` (human-facing, read back by `query_state`). The pair is always set together.

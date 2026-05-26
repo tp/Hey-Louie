@@ -32,11 +32,22 @@ IPAD_DAY_2.md.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, override
 
 from backend.adapters.base import ToolResultBlock, ToolSchema
 from backend.agent.session import Session
+
+# Type alias for the ask_user picker. Takes the model's question + choice list,
+# returns the chosen choice's `id`. The eval suite stages the user's tap in
+# advance by overriding this on the FakeLouie instance (or via `EvalCase.setup`).
+AskUserPicker = Callable[[str, list[dict[str, str]]], str]
+
+
+def _pick_first(_question: str, choices: list[dict[str, str]]) -> str:
+    return choices[0]["id"]
+
 
 ROOMS: tuple[str, ...] = ("living_room", "kitchen", "bedroom")
 _MUSIC_TYPES: tuple[str, ...] = ("artist", "album", "genre", "playlist", "track")
@@ -247,6 +258,57 @@ LOUIE_TOOL_SCHEMAS: list[ToolSchema] = [
             },
         },
     ),
+    ToolSchema(
+        name="ask_user",
+        description=(
+            "Ask the user to disambiguate between concrete options when their request is "
+            "genuinely ambiguous AND picking the wrong default would noticeably annoy them. "
+            "The user sees a tap popover (not a re-record) with the choices you provide; the "
+            "tool_result is the picked {id, label}. USE SPARINGLY — prefer confident action "
+            "with a one-sentence narration over asking. Never ask about which room or what "
+            "temperature; pick a sensible default and say what you did. Only call this when "
+            "(a) two or more plausible interpretations exist (e.g. 'play Thriller' → song or "
+            "album?) AND (b) no prior tool result already resolves the ambiguity. The `id` "
+            "strings you supply MUST be tokens that make sense for your follow-up action — "
+            "typically values returned from a previous tool call (e.g. search_music hit ids), "
+            "not free-form strings."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "Short, spoken-aloud-friendly question. No markdown, no preamble like "
+                        "'sure!'. Examples: 'The song or the album?', 'Which Coldplay album?'."
+                    ),
+                },
+                "choices": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 5,
+                    "description": "2-5 distinct options the user can tap.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": (
+                                    "Opaque token to act on after the tap (e.g. a search_music id)."
+                                ),
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": "Short human-facing label, 1-4 words.",
+                            },
+                        },
+                        "required": ["id", "label"],
+                    },
+                },
+            },
+            "required": ["question", "choices"],
+        },
+    ),
 ]
 
 
@@ -264,6 +326,15 @@ class FakeLouie(Session):
     music: MusicState = field(default_factory=MusicState)
     lights: dict[str, Light] = field(default_factory=lambda: {r: Light() for r in ROOMS})
     climate: dict[str, Climate] = field(default_factory=lambda: {r: Climate() for r in ROOMS})
+
+    # ask_user is client-mediated: the real iPad shows a tap popover and the
+    # user's choice id comes back as tool_result. For evals the "user" is a
+    # function: pick first by default, override per-case in EvalCase.setup
+    # to stage richer disambiguation scenarios.
+    ask_user_picker: AskUserPicker = field(default=_pick_first)
+    # Audit trail so eval `check` callbacks can assert what was asked. Each
+    # entry is (question, choices_snapshot, picked_id).
+    ask_user_log: list[tuple[str, list[dict[str, str]], str]] = field(default_factory=list)
 
     # --- Session protocol -------------------------------------------------
 
@@ -411,10 +482,40 @@ def _h_query_state(state: FakeLouie, args: dict[str, Any]) -> str:
     raise ValueError(f"`subsystem` must be one of {list(_SUBSYSTEMS)}, got {subsystem!r}")
 
 
+def _h_ask_user(state: FakeLouie, args: dict[str, Any]) -> str:
+    question = args.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("`question` is required and must be a non-empty string")
+    raw_choices: Any = args.get("choices")
+    if not isinstance(raw_choices, list) or len(raw_choices) < 2:
+        raise ValueError("`choices` must be a list of at least 2 options")
+    normalized: list[dict[str, str]] = []
+    for i, raw in enumerate(raw_choices):
+        c: Any = raw
+        if not isinstance(c, dict):
+            raise ValueError(f"choices[{i}] must be an object with string `id` and `label`")
+        cid: Any = c.get("id")
+        clabel: Any = c.get("label")
+        if not isinstance(cid, str) or not isinstance(clabel, str):
+            raise ValueError(f"choices[{i}] must be an object with string `id` and `label`")
+        normalized.append({"id": cid, "label": clabel})
+
+    picked_id = state.ask_user_picker(question, normalized)
+    picked = next((c for c in normalized if c["id"] == picked_id), None)
+    if picked is None:
+        # Picker returned an id not in the offered choices — a real iPad
+        # couldn't do this, but tests with custom pickers might fat-finger it.
+        raise ValueError(f"picker returned id {picked_id!r} not in offered choices")
+
+    state.ask_user_log.append((question, normalized, picked_id))
+    return json.dumps(picked)
+
+
 _HANDLERS = {
     "search_music": _h_search_music,
     "play_music": _h_play_music,
     "control_lights": _h_control_lights,
     "set_climate": _h_set_climate,
     "query_state": _h_query_state,
+    "ask_user": _h_ask_user,
 }
