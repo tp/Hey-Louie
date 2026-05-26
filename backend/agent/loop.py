@@ -188,6 +188,7 @@ async def run_turn(
     max_steps: int = 8,
     extra_tools: Sequence[ToolSchema] = (),
     cancel_token: asyncio.Event | None = None,
+    conversation_id: str | None = None,
 ) -> TurnResult:
     """Drive one user utterance to a final assistant response.
 
@@ -217,6 +218,16 @@ async def run_turn(
         span.set_data("gen_ai.operation.name", "invoke_agent")
         span.set_data("gen_ai.agent.name", "louie")
         span.set_data("gen_ai.request.model", adapter.model)
+        # Set on the scope (not just this span) so the SDK auto-stamps
+        # `gen_ai.conversation.id` onto every gen_ai.* child span when it
+        # finishes — including the AnthropicIntegration's gen_ai.chat spans,
+        # which is what populates Sentry's AI Conversations "Chat" tab. See
+        # sentry_sdk/tracing.py:680. Removed in `finally` so the ID doesn't
+        # leak across turns sharing a scope (FastAPI's request scope, the
+        # eval runner's task scope).
+        scope = sentry_sdk.get_current_scope()
+        if conversation_id is not None:
+            scope.set_conversation_id(conversation_id)
         # `gen_ai.prompt` here is the user's utterance, not the system prompt —
         # the system prompt repeats across every call and would dominate the
         # span payload. Sentry's PII gating already covers this.
@@ -300,6 +311,8 @@ async def run_turn(
             span.set_data("gen_ai.usage.total_tokens", input_tokens + output_tokens)
             span.set_data("gen_ai.response.stop_reason", stop_reason)
             span.set_data("louie.tool_call_count", len(tool_calls))
+            if conversation_id is not None:
+                scope.remove_conversation_id()
 
 
 def _join_text(message: Message) -> str:

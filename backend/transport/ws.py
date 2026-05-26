@@ -275,7 +275,9 @@ def _parse_tools(raw: Any) -> list[ToolSchema]:
 async def _run_one_turn(session: WebSocketSession, utterance: str) -> None:
     """Drive the agent loop for one utterance, then send `final_text` and close."""
     try:
-        result = await run_turn(session.adapter, session, utterance)
+        result = await run_turn(
+            session.adapter, session, utterance, conversation_id=session.session_id
+        )
         await session.send({"type": "final_text", "text": result.final_text})
     except asyncio.CancelledError:
         log.info("session %s: turn cancelled", session.session_id)
