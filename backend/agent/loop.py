@@ -23,19 +23,79 @@ picked choice id comes back as `tool_result`.)
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
+
+import sentry_sdk
 
 from backend.adapters.base import (
     LLMAdapter,
     Message,
     StopReason,
     TextBlock,
+    ToolResultBlock,
     ToolSchema,
     ToolUseBlock,
 )
 from backend.agent.session import Session
+
+# Cap manual span attribute size. Sentry truncates anyway; doing it ourselves
+# keeps inputs/outputs readable in the dashboard rather than landing as
+# silently-clipped JSON. 2 KB is enough for our biggest payload (`query_state`
+# subsystem='all' is ~600 bytes) plus headroom.
+_SPAN_ATTR_MAX = 2048
+
+
+def _truncate(s: str, limit: int = _SPAN_ATTR_MAX) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"...[+{len(s) - limit}B]"
+
+
+def _agent_span(name: str) -> AbstractContextManager[Any]:
+    """Open the agent's root span.
+
+    Sentry's transaction-vs-span split is load-bearing: a `start_span` at the
+    top level (no active transaction) is silently dropped, while `start_span`
+    nested inside one is recorded. So this helper picks one or the other
+    based on whether we're already inside a transaction.
+
+    - Eval suite (no FastAPI / no parent transaction): create a root
+      transaction so the trace is sent.
+    - WebSocket path (FastAPI integration already opened a transaction for
+      the upgrade): nest as a span of that transaction.
+    """
+    scope = sentry_sdk.get_current_scope()
+    if scope.transaction is None:
+        return sentry_sdk.start_transaction(op="gen_ai.invoke_agent", name=name)
+    return sentry_sdk.start_span(op="gen_ai.invoke_agent", name=name)
+
+
+async def _dispatch_tool_with_span(
+    session: Session, name: str, args: dict[str, Any], tool_use_id: str
+) -> ToolResultBlock:
+    """Wrap one `session.dispatch_tool` call in a `gen_ai.execute_tool` span.
+
+    Attribute names follow OpenTelemetry's GenAI conventions so Sentry's AI
+    Agents view groups these correctly under the parent invoke_agent span.
+    `asyncio.gather` copies the parent context into each task, so concurrent
+    tool calls render as parallel children, not chained.
+    """
+    with sentry_sdk.start_span(op="gen_ai.execute_tool", name=f"execute_tool {name}") as span:
+        span.set_data("gen_ai.operation.name", "execute_tool")
+        span.set_data("gen_ai.tool.name", name)
+        span.set_data("gen_ai.tool.call.id", tool_use_id)
+        span.set_data("gen_ai.tool.input", _truncate(json.dumps(args)))
+        result = await session.dispatch_tool(name, args, tool_use_id)
+        span.set_data("gen_ai.tool.output", _truncate(result.content))
+        if result.is_error:
+            span.set_data("is_error", True)
+            span.set_status("internal_error")
+        return result
+
 
 # One paragraph. Each clause earns its place; the eval suite is the regression
 # net if a tweak helps one case and breaks another. Day-3 stretch is to A/B
@@ -149,67 +209,93 @@ async def run_turn(
 
     tools: list[ToolSchema] = [*session.schemas(), *extra_tools]
 
-    for step in range(1, max_steps + 1):
-        # Check before paying for the model call. In production the WebSocket
-        # `cancel` message sets this; in evals the runner wires it to fire
-        # after the first tool result.
-        if cancel_token is not None and cancel_token.is_set():
-            raise TurnCancelled(
-                messages,
-                tool_calls,
-                step - 1,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                model=last_model,
+    with _agent_span("invoke_agent louie") as span:
+        span.set_data("gen_ai.operation.name", "invoke_agent")
+        span.set_data("gen_ai.agent.name", "louie")
+        span.set_data("gen_ai.request.model", adapter.model)
+        # `gen_ai.prompt` here is the user's utterance, not the system prompt —
+        # the system prompt repeats across every call and would dominate the
+        # span payload. Sentry's PII gating already covers this.
+        span.set_data("gen_ai.prompt", _truncate(utterance))
+
+        try:
+            for step in range(1, max_steps + 1):
+                # Check before paying for the model call. In production the WebSocket
+                # `cancel` message sets this; in evals the runner wires it to fire
+                # after the first tool result.
+                if cancel_token is not None and cancel_token.is_set():
+                    raise TurnCancelled(
+                        messages,
+                        tool_calls,
+                        step - 1,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        model=last_model,
+                    )
+
+                result = await adapter.complete(system=system, messages=messages, tools=tools)
+                messages.append(result.message)
+                input_tokens += result.usage.input_tokens
+                output_tokens += result.usage.output_tokens
+                last_model = result.usage.model
+                stop_reason = result.stop_reason
+
+                if result.stop_reason != "tool_use":
+                    final_text = _join_text(result.message)
+                    span.set_data("gen_ai.response.text", _truncate(final_text))
+                    return TurnResult(
+                        final_text=final_text,
+                        stop_reason=stop_reason,
+                        tool_calls=tool_calls,
+                        messages=messages,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        steps=step,
+                        model=last_model,
+                    )
+
+                tool_uses = [b for b in result.message.content if isinstance(b, ToolUseBlock)]
+
+                # gather() preserves input order, so results line up with tool_uses by
+                # index — needed to pair tool_use_ids back to their results.
+                results = await asyncio.gather(
+                    *[
+                        _dispatch_tool_with_span(session, tu.name, tu.input, tu.id)
+                        for tu in tool_uses
+                    ]
+                )
+                for tu, res in zip(tool_uses, results, strict=True):
+                    tool_calls.append(
+                        ToolCallRecord(name=tu.name, input=tu.input, is_error=res.is_error)
+                    )
+
+                messages.append(Message(role="user", content=list(results)))
+
+                # Second check: tool results are in but we haven't started the next
+                # model call yet. Cheapest place to honor a cancel that arrived while
+                # tools were running.
+                if cancel_token is not None and cancel_token.is_set():
+                    raise TurnCancelled(
+                        messages,
+                        tool_calls,
+                        step,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        model=last_model,
+                    )
+
+            raise AgentLoopError(
+                f"agent loop exceeded max_steps={max_steps} (last stop_reason={stop_reason})"
             )
-
-        result = await adapter.complete(system=system, messages=messages, tools=tools)
-        messages.append(result.message)
-        input_tokens += result.usage.input_tokens
-        output_tokens += result.usage.output_tokens
-        last_model = result.usage.model
-        stop_reason = result.stop_reason
-
-        if result.stop_reason != "tool_use":
-            return TurnResult(
-                final_text=_join_text(result.message),
-                stop_reason=stop_reason,
-                tool_calls=tool_calls,
-                messages=messages,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                steps=step,
-                model=last_model,
-            )
-
-        tool_uses = [b for b in result.message.content if isinstance(b, ToolUseBlock)]
-
-        # gather() preserves input order, so results line up with tool_uses by
-        # index — needed to pair tool_use_ids back to their results.
-        results = await asyncio.gather(
-            *[session.dispatch_tool(tu.name, tu.input, tu.id) for tu in tool_uses]
-        )
-        for tu, res in zip(tool_uses, results, strict=True):
-            tool_calls.append(ToolCallRecord(name=tu.name, input=tu.input, is_error=res.is_error))
-
-        messages.append(Message(role="user", content=list(results)))
-
-        # Second check: tool results are in but we haven't started the next
-        # model call yet. Cheapest place to honor a cancel that arrived while
-        # tools were running.
-        if cancel_token is not None and cancel_token.is_set():
-            raise TurnCancelled(
-                messages,
-                tool_calls,
-                step,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                model=last_model,
-            )
-
-    raise AgentLoopError(
-        f"agent loop exceeded max_steps={max_steps} (last stop_reason={stop_reason})"
-    )
+        finally:
+            # Capture totals on every exit path — success, cancel, max_steps,
+            # uncaught adapter error. The screenshot the blog post wants is
+            # only useful if these are populated even on red paths.
+            span.set_data("gen_ai.usage.input_tokens", input_tokens)
+            span.set_data("gen_ai.usage.output_tokens", output_tokens)
+            span.set_data("gen_ai.usage.total_tokens", input_tokens + output_tokens)
+            span.set_data("gen_ai.response.stop_reason", stop_reason)
+            span.set_data("louie.tool_call_count", len(tool_calls))
 
 
 def _join_text(message: Message) -> str:
