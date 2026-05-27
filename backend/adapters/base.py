@@ -65,9 +65,16 @@ class ToolSchema:
 
 @dataclass(frozen=True)
 class Usage:
+    # `input_tokens` is the FULL prompt size (uncached + cache_read + cache_write).
+    # Both adapters normalize to this so the eval CSV and Sentry view compare
+    # apples to apples. Anthropic's API reports uncached-only by default; we add
+    # the cache portions back in. OpenAI already reports a total.
     input_tokens: int
     output_tokens: int
     model: str
+    cache_read_input_tokens: int = 0
+    # Anthropic only — OpenAI auto-caches and doesn't bill writes separately.
+    cache_write_input_tokens: int = 0
 
 
 @dataclass(frozen=True)

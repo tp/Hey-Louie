@@ -54,6 +54,9 @@ AdapterFactory = Callable[[], LLMAdapter]
 
 def _default_adapter_factory() -> LLMAdapter:
     # Randomize provider per session so both adapters get exercised in normal use.
+    # Haiku is excluded — it misfires on the ask_user disambiguation rule
+    # (verbalizes the clarifying question instead of calling the tool). Still
+    # in the eval matrix for tracking; not in production rotation.
     return random.choice([AnthropicAdapter, OpenAIAdapter])()
 
 
