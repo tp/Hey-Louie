@@ -209,6 +209,8 @@ async def run_turn(
     tool_calls: list[ToolCallRecord] = []
     input_tokens = 0
     output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
     last_model = adapter.model
     stop_reason: StopReason = "end_turn"
 
@@ -252,6 +254,8 @@ async def run_turn(
                 messages.append(result.message)
                 input_tokens += result.usage.input_tokens
                 output_tokens += result.usage.output_tokens
+                cache_read_tokens += result.usage.cache_read_input_tokens
+                cache_write_tokens += result.usage.cache_write_input_tokens
                 last_model = result.usage.model
                 stop_reason = result.stop_reason
 
@@ -309,6 +313,12 @@ async def run_turn(
             span.set_data("gen_ai.usage.input_tokens", input_tokens)
             span.set_data("gen_ai.usage.output_tokens", output_tokens)
             span.set_data("gen_ai.usage.total_tokens", input_tokens + output_tokens)
+            # Cache stats let us tell at a glance whether the prefix cache is
+            # actually hitting. Anthropic exposes both fields; for OpenAI
+            # `cache_write_input_tokens` is always 0 (auto-cache, no separate
+            # billing line) — the read counter is the one to watch.
+            span.set_data("gen_ai.usage.cache_read_input_tokens", cache_read_tokens)
+            span.set_data("gen_ai.usage.cache_creation_input_tokens", cache_write_tokens)
             span.set_data("gen_ai.response.stop_reason", stop_reason)
             span.set_data("louie.tool_call_count", len(tool_calls))
             if conversation_id is not None:

@@ -82,11 +82,16 @@ def _message_to_input_items(message: Message) -> list[dict[str, Any]]:
                 }
             )
         else:
+            # Plain-string content (not the `[{"type":"input_text",...}]` array
+            # form) so Sentry's Conversations view actually renders the user
+            # utterance — the renderer only knows the string form. The Responses
+            # API accepts both shapes; semantically equivalent for the model.
+            # See FOLLOWUPS.md "Sentry Conversations view: incomplete rendering".
             items.append(
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": joined}],
+                    "content": joined,
                 }
             )
 
@@ -160,11 +165,17 @@ class OpenAIAdapter:
         for m in messages:
             input_items.extend(_message_to_input_items(m))
 
+        # Sort tools by name. OpenAI's auto prompt cache also keys on the
+        # serialized prefix, so any reorder from the iPad's tool catalog would
+        # break cache hits on prompts ≥1024 tokens. Same rationale as the
+        # Anthropic adapter.
+        sorted_tools = [_tool_to_openai(t) for t in sorted(tools, key=lambda t: t.name)]
+
         resp = await self._client.responses.create(
             model=self.model,
             instructions=system,
             input=input_items,
-            tools=[_tool_to_openai(t) for t in tools],
+            tools=sorted_tools,
             max_output_tokens=self._max_tokens,
             # Don't persist server-side state; we own the conversation history.
             store=False,
@@ -203,6 +214,11 @@ class OpenAIAdapter:
         stop_reason = _resolve_stop_reason(has_tool_use, resp.status, incomplete_reason)
 
         usage = resp.usage
+        cached_tokens = 0
+        if usage is not None:
+            details = getattr(usage, "input_tokens_details", None)
+            if details is not None:
+                cached_tokens = getattr(details, "cached_tokens", 0) or 0
         return CompletionResult(
             message=Message(role="assistant", content=blocks),
             stop_reason=stop_reason,
@@ -210,5 +226,6 @@ class OpenAIAdapter:
                 input_tokens=usage.input_tokens if usage else 0,
                 output_tokens=usage.output_tokens if usage else 0,
                 model=resp.model,
+                cache_read_input_tokens=cached_tokens,
             ),
         )

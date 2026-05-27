@@ -40,6 +40,7 @@ from backend.evals.fake_louie import FakeLouie
 _PRICING: dict[str, tuple[float, float]] = {
     # (input $/Mtok, output $/Mtok)
     "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
     "claude-opus-4-7": (15.0, 75.0),
     "gpt-5-mini": (0.25, 2.0),
     "gpt-5": (1.25, 10.0),
@@ -106,7 +107,16 @@ def _param(label: str, factory: AdapterFactory, env_key: str) -> pytest.param:  
 
 
 ADAPTERS = [
-    _param("anthropic", lambda: AnthropicAdapter(model="claude-sonnet-4-6"), "ANTHROPIC_API_KEY"),
+    _param(
+        "anthropic-sonnet",
+        lambda: AnthropicAdapter(model="claude-sonnet-4-6"),
+        "ANTHROPIC_API_KEY",
+    ),
+    _param(
+        "anthropic-haiku",
+        lambda: AnthropicAdapter(model="claude-haiku-4-5"),
+        "ANTHROPIC_API_KEY",
+    ),
     _param("openai", lambda: OpenAIAdapter(model="gpt-5-mini"), "OPENAI_API_KEY"),
 ]
 
